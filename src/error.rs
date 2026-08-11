@@ -1,3 +1,4 @@
+use crate::wal::WalError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -28,6 +29,12 @@ pub enum Error {
 
     #[error("queue system is shutting down")]
     ShuttingDown,
+
+    #[error("payload too large: {0} bytes exceeds maximum of {1}")]
+    PayloadTooLarge(usize, usize),
+
+    #[error("storage error: {0}")]
+    Storage(#[from] WalError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

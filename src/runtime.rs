@@ -3,6 +3,7 @@ use crate::coordinator::{Command, Coordinator};
 use crate::error::{Error, Result};
 use crate::handler::Handler;
 use crate::stats::StatsSnapshot;
+use crate::store::Storage;
 use crate::types::{JobId, JobRecord, JobSpec, QueueName};
 use crate::worker::run_workers;
 use std::collections::HashMap;
@@ -24,6 +25,9 @@ impl Runtime {
     pub async fn start<H: Handler>(config: RuntimeConfig, handler: H) -> Result<Self> {
         config.validate()?;
 
+        // Open storage based on config.
+        let storage = Storage::open(&config.storage)?;
+
         let mut semaphores = HashMap::new();
         for qc in &config.queues {
             let sem = Arc::new(Semaphore::new(qc.capacity));
@@ -36,6 +40,7 @@ impl Runtime {
 
         let coordinator = Coordinator::new(
             config.clone(),
+            storage,
             cmd_rx,
             semaphores.clone(),
             shutdown_token.clone(),
@@ -162,18 +167,14 @@ impl Runtime {
             .send(Command::Shutdown { reply: reply_tx })
             .await;
 
-        // Wait for coordinator to signal shutdown complete.
         let _ = reply_rx.await;
 
-        // Wait for workers to exit.
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.await;
         }
 
-        // Drop sender to close coordinator channel.
         drop(self.cmd_tx);
 
-        // Wait for coordinator.
         if let Some(handle) = self.coordinator_handle.take() {
             let _ = handle.await;
         }

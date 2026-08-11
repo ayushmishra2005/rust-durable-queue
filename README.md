@@ -16,6 +16,7 @@ A single-process async job queue written in Rust. Currently under development.
 - Round-robin scheduling across named queues
 - Parked workers (no polling)
 - Coordinator-owned mutable state (no shared locks)
+- **WAL durability layer** with persist-before-apply ordering
 
 ## Job Lifecycle
 
@@ -104,11 +105,39 @@ Cancellation is cooperative: handlers should check `ctx.is_cancelled()` for
 timely exit. Async tasks can be aborted, but external side effects may already
 have occurred.
 
+## Durability
+
+WAL mode provides durable transition writes:
+
+```rust
+let config = RuntimeConfig::new(queues, 64)
+    .with_storage(StorageConfig::Wal { path: "data".into() });
+```
+
+In WAL mode, all state transitions follow persist-before-apply ordering:
+
+1. Build WAL record
+2. Append to WAL file
+3. `sync_data()` to disk
+4. Apply to in-memory state
+5. Expose result to caller
+
+This ensures:
+- Workers never execute before their lease is durable
+- Capacity is never released before terminal state is durable
+- Memory state is never mutated before successful persistence
+
+**Important:** WAL replay/recovery is NOT yet implemented. Restarting the
+process will NOT restore jobs from the WAL. Recovery will be added in the
+next development stage.
+
+See [docs/wal-format.md](docs/wal-format.md) for WAL format details.
+
 ## Development Status
 
-**Current step:** in-memory async job runtime with workers, leases, and retries.
+**Current step:** WAL durability layer with persist-before-apply ordering.
 
-Future work will add durability (WAL-based persistence).
+Next: WAL replay and crash recovery.
 
 ## Build and Test
 

@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::store::StorageConfig;
 use crate::types::QueueName;
 use rand::Rng;
 use std::collections::HashSet;
@@ -131,6 +132,7 @@ pub struct RuntimeConfig {
     pub visibility_timeout: Duration,
     pub retry: RetryConfig,
     pub shutdown_timeout: Duration,
+    pub storage: StorageConfig,
 }
 
 impl RuntimeConfig {
@@ -142,6 +144,7 @@ impl RuntimeConfig {
             visibility_timeout: Duration::from_secs(30),
             retry: RetryConfig::default(),
             shutdown_timeout: Duration::from_secs(30),
+            storage: StorageConfig::default(),
         }
     }
 
@@ -162,6 +165,11 @@ impl RuntimeConfig {
 
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
+        self
+    }
+
+    pub fn with_storage(mut self, storage: StorageConfig) -> Self {
+        self.storage = storage;
         self
     }
 

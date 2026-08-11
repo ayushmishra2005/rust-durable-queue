@@ -2,8 +2,11 @@ use crate::config::RuntimeConfig;
 use crate::error::{Error, Result};
 use crate::handler::JobContext;
 use crate::stats::{QueueStats, StatsSnapshot};
-use crate::store::MemoryStore;
-use crate::types::{JobId, JobRecord, JobSpec, JobState, LeaseId, QueueName};
+use crate::store::{MemoryStore, Storage};
+use crate::types::{
+    JobId, JobRecord, JobSpec, JobState, LeaseId, MAX_PAYLOAD_SIZE, QueueName, UnixMillis,
+};
+use crate::wal::WalRecord;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -63,6 +66,7 @@ pub struct LeasedJob {
 #[derive(Debug, Eq, PartialEq)]
 struct RetryEntry {
     available_at: Instant,
+    wall_clock_available_at: UnixMillis, // Persisted time for future replay.
     job_id: JobId,
 }
 
@@ -114,15 +118,13 @@ struct GlobalStats {
 /// Coordinator owns all mutable queue state.
 pub struct Coordinator {
     store: MemoryStore,
+    storage: Storage,
     queues: HashMap<String, QueueState>,
-    // Queue names in config order for round-robin scheduling.
     queue_order: Vec<String>,
-    // Next queue index for round-robin.
     next_queue_idx: usize,
     permits: HashMap<JobId, OwnedSemaphorePermit>,
     leases: HashMap<JobId, ActiveLease>,
     retry_queue: BinaryHeap<RetryEntry>,
-    // Parked worker requests. Bounded by worker_concurrency (one per worker).
     parked_workers: VecDeque<oneshot::Sender<Option<LeasedJob>>>,
     semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
     cmd_rx: mpsc::Receiver<Command>,
@@ -139,12 +141,14 @@ pub struct Coordinator {
 impl Coordinator {
     pub fn new(
         config: RuntimeConfig,
+        storage: Storage,
         cmd_rx: mpsc::Receiver<Command>,
         semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
         shutdown_token: CancellationToken,
     ) -> Self {
         Self::with_rng(
             config,
+            storage,
             cmd_rx,
             semaphores,
             shutdown_token,
@@ -154,6 +158,7 @@ impl Coordinator {
 
     pub fn with_rng(
         config: RuntimeConfig,
+        storage: Storage,
         cmd_rx: mpsc::Receiver<Command>,
         semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
         shutdown_token: CancellationToken,
@@ -169,6 +174,7 @@ impl Coordinator {
 
         Self {
             store: MemoryStore::new(),
+            storage,
             queues,
             queue_order,
             next_queue_idx: 0,
@@ -192,20 +198,18 @@ impl Coordinator {
     pub async fn run(mut self) {
         loop {
             self.process_due_retries();
-            self.check_lease_timeouts();
-            self.try_dispatch_parked_workers();
+            self.check_lease_timeouts().await;
+            self.try_dispatch_parked_workers().await;
 
-            // Check if graceful shutdown can complete.
             if self.shutting_down && self.leases.is_empty() {
                 self.complete_shutdown();
                 break;
             }
 
-            // Check shutdown timeout.
             if let Some(deadline) = self.shutdown_deadline
                 && Instant::now() >= deadline
             {
-                self.force_shutdown();
+                self.force_shutdown().await;
                 break;
             }
 
@@ -216,18 +220,16 @@ impl Coordinator {
 
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
-                        Some(cmd) => self.handle(cmd),
+                        Some(cmd) => self.handle(cmd).await,
                         None => break,
                     }
                 }
 
                 _ = Self::sleep_until_opt(next_deadline) => {
-                    // Timer expired, loop processes on next iteration.
                 }
             }
         }
 
-        // Close semaphores to wake blocked submitters.
         for sem in self.semaphores.values() {
             sem.close();
         }
@@ -251,7 +253,6 @@ impl Coordinator {
             (None, None) => None,
         };
 
-        // Include shutdown deadline.
         if let Some(sd) = self.shutdown_deadline {
             deadline = Some(deadline.map_or(sd, |d| d.min(sd)));
         }
@@ -259,7 +260,7 @@ impl Coordinator {
         deadline
     }
 
-    fn handle(&mut self, cmd: Command) {
+    async fn handle(&mut self, cmd: Command) {
         match cmd {
             Command::Submit {
                 queue,
@@ -270,7 +271,7 @@ impl Coordinator {
                 let result = if self.shutting_down {
                     Err(Error::ShuttingDown)
                 } else {
-                    self.do_submit(queue, spec, permit)
+                    self.do_submit(queue, spec, permit).await
                 };
                 let _ = reply.send(result);
             }
@@ -279,7 +280,7 @@ impl Coordinator {
                 let _ = reply.send(result);
             }
             Command::Cancel { id, reply } => {
-                let result = self.do_cancel(id);
+                let result = self.do_cancel(id).await;
                 let _ = reply.send(result);
             }
             Command::Stats { reply } => {
@@ -287,14 +288,14 @@ impl Coordinator {
                 let _ = reply.send(stats);
             }
             Command::FetchWork { reply } => {
-                self.do_fetch_work(reply);
+                self.do_fetch_work(reply).await;
             }
             Command::WorkerOutcome {
                 id,
                 lease_id,
                 outcome,
             } => {
-                self.do_worker_outcome(id, lease_id, outcome);
+                self.do_worker_outcome(id, lease_id, outcome).await;
             }
             Command::Shutdown { reply } => {
                 self.start_shutdown(reply);
@@ -311,23 +312,19 @@ impl Coordinator {
         self.shutting_down = true;
         self.shutdown_token.cancel();
 
-        // Close semaphores to wake blocked submitters.
         for sem in self.semaphores.values() {
             sem.close();
         }
 
-        // Wake all parked workers with None (no more work).
         while let Some(worker) = self.parked_workers.pop_front() {
             let _ = worker.send(None);
         }
 
-        // If no running jobs, complete immediately.
         if self.leases.is_empty() {
             let _ = reply.send(());
             return;
         }
 
-        // Set deadline and save reply for later.
         self.shutdown_deadline = Some(Instant::now() + self.config.shutdown_timeout);
         self.shutdown_reply = Some(reply);
     }
@@ -338,8 +335,7 @@ impl Coordinator {
         }
     }
 
-    fn force_shutdown(&mut self) {
-        // Cancel all remaining leases after timeout.
+    async fn force_shutdown(&mut self) {
         let job_ids: Vec<_> = self.leases.keys().copied().collect();
         for job_id in job_ids {
             if let Some(lease) = self.leases.remove(&job_id) {
@@ -349,29 +345,48 @@ impl Coordinator {
         self.complete_shutdown();
     }
 
-    fn do_submit(
+    /// SUBMIT ordering: validate -> build record -> persist -> apply -> expose.
+    async fn do_submit(
         &mut self,
         queue: QueueName,
         spec: JobSpec,
         permit: OwnedSemaphorePermit,
     ) -> Result<JobRecord> {
+        // 1. Validate queue exists and payload size.
         let qs = self
             .queues
             .get_mut(queue.as_str())
             .ok_or_else(|| Error::QueueNotFound(queue.to_string()))?;
 
+        if spec.payload.len() > MAX_PAYLOAD_SIZE {
+            return Err(Error::PayloadTooLarge(spec.payload.len(), MAX_PAYLOAD_SIZE));
+        }
+
+        // 2. Build WAL record.
         let id = JobId::new();
-        let record = self.store.insert(id, queue, spec);
+        let created_at = UnixMillis::now();
+        let wal_record = WalRecord::JobSubmitted {
+            id,
+            queue: queue.clone(),
+            spec: spec.clone(),
+            created_at,
+        };
 
+        // 3. Persist (WAL append + sync).
+        self.storage.persist(wal_record.clone()).await?;
+
+        // 4. Apply to memory.
+        self.store.apply_record(&wal_record)?;
+        let record = self.store.get(id).cloned().unwrap();
+
+        // 5. Expose (update stats, queue, hold permit).
         self.permits.insert(id, permit);
-
         qs.ready.push_back(id);
         qs.stats.submitted += 1;
         qs.stats.queued += 1;
         self.global_stats.submitted += 1;
 
-        // Try to wake a parked worker.
-        self.try_dispatch_parked_workers();
+        self.try_dispatch_parked_workers().await;
 
         Ok(record)
     }
@@ -383,7 +398,9 @@ impl Coordinator {
             .ok_or_else(|| Error::JobNotFound(id.to_string()))
     }
 
-    fn do_cancel(&mut self, id: JobId) -> Result<JobRecord> {
+    /// CANCEL ordering: validate -> build record -> persist -> apply -> expose.
+    async fn do_cancel(&mut self, id: JobId) -> Result<JobRecord> {
+        // 1. Validate job exists and can be cancelled.
         let job = self
             .store
             .get(id)
@@ -392,8 +409,25 @@ impl Coordinator {
         let from_state = job.state;
         let queue_name = job.queue.clone();
 
-        let record = self.store.transition(id, JobState::Cancelled)?;
+        if from_state.is_terminal() {
+            return Err(Error::InvalidTransition {
+                from: from_state,
+                to: JobState::Cancelled,
+            });
+        }
 
+        // 2. Build WAL record.
+        let cancelled_at = UnixMillis::now();
+        let wal_record = WalRecord::JobCancelled { id, cancelled_at };
+
+        // 3. Persist.
+        self.storage.persist(wal_record.clone()).await?;
+
+        // 4. Apply to memory.
+        self.store.apply_record(&wal_record)?;
+        let record = self.store.get(id).cloned().unwrap();
+
+        // 5. Expose (update stats, release resources).
         if let Some(qs) = self.queues.get_mut(queue_name.as_str()) {
             match from_state {
                 JobState::Queued => {
@@ -453,24 +487,22 @@ impl Coordinator {
         }
     }
 
-    fn do_fetch_work(&mut self, reply: oneshot::Sender<Option<LeasedJob>>) {
+    async fn do_fetch_work(&mut self, reply: oneshot::Sender<Option<LeasedJob>>) {
         if self.shutting_down {
             let _ = reply.send(None);
             return;
         }
 
-        // Try to assign work immediately.
-        if let Some(job) = self.try_lease_job() {
+        if let Some(job) = self.try_lease_job().await {
             let _ = reply.send(Some(job));
             return;
         }
 
-        // Park the worker until work is available.
         self.parked_workers.push_back(reply);
     }
 
-    /// Round-robin selection across queues.
-    fn try_lease_job(&mut self) -> Option<LeasedJob> {
+    /// LEASE ordering: choose job -> build record -> persist -> apply -> expose.
+    async fn try_lease_job(&mut self) -> Option<LeasedJob> {
         let n = self.queue_order.len();
         if n == 0 {
             return None;
@@ -481,64 +513,90 @@ impl Coordinator {
             self.next_queue_idx = (self.next_queue_idx + 1) % n;
 
             let job_id = match self.queues.get_mut(&queue_name) {
-                Some(qs) => match qs.ready.pop_front() {
+                Some(qs) => match qs.ready.front().copied() {
                     Some(id) => id,
                     None => continue,
                 },
                 None => continue,
             };
 
-            return self.lease_job(job_id, &queue_name);
+            // Check job is still valid for leasing.
+            let job = match self.store.get(job_id) {
+                Some(j) if j.state == JobState::Queued => j,
+                _ => continue,
+            };
+
+            // Build lease parameters.
+            let attempt = job.attempts + 1;
+            let lease_id = LeaseId::new(self.next_lease_epoch);
+            let leased_at = UnixMillis::now();
+
+            // Build WAL record.
+            let wal_record = WalRecord::JobLeased {
+                id: job_id,
+                lease_id,
+                attempt,
+                leased_at,
+            };
+
+            // Persist.
+            if let Err(e) = self.storage.persist(wal_record.clone()).await {
+                // Persist failed - job stays Queued, not exposed to worker.
+                tracing_style_log("lease persist failed", &e);
+                continue;
+            }
+
+            // Now commit: remove from ready queue.
+            if let Some(qs) = self.queues.get_mut(&queue_name) {
+                qs.ready.pop_front();
+            }
+
+            // Apply to memory.
+            if self.store.apply_record(&wal_record).is_err() {
+                continue;
+            }
+            self.next_lease_epoch += 1;
+
+            // Setup lease tracking.
+            let cancellation = CancellationToken::new();
+            let deadline = Instant::now() + self.config.visibility_timeout;
+
+            self.leases.insert(
+                job_id,
+                ActiveLease {
+                    lease_id,
+                    deadline,
+                    cancellation: cancellation.clone(),
+                },
+            );
+
+            if let Some(qs) = self.queues.get_mut(&queue_name) {
+                qs.stats.queued = qs.stats.queued.saturating_sub(1);
+                qs.stats.running += 1;
+            }
+
+            let job = self.store.get(job_id)?;
+            let context = JobContext {
+                id: job.id,
+                queue: job.queue.clone(),
+                payload: job.spec.payload.clone(),
+                attempt: job.attempts,
+                max_attempts: job.spec.max_attempts,
+                cancellation,
+            };
+
+            return Some(LeasedJob { context, lease_id });
         }
         None
     }
 
-    fn lease_job(&mut self, job_id: JobId, queue_name: &str) -> Option<LeasedJob> {
-        let job = self.store.get_mut(job_id)?;
-
-        job.attempts += 1;
-        job.state = JobState::Running;
-
-        let lease_id = LeaseId::new(self.next_lease_epoch);
-        self.next_lease_epoch += 1;
-
-        let cancellation = CancellationToken::new();
-        let deadline = Instant::now() + self.config.visibility_timeout;
-
-        self.leases.insert(
-            job_id,
-            ActiveLease {
-                lease_id,
-                deadline,
-                cancellation: cancellation.clone(),
-            },
-        );
-
-        if let Some(qs) = self.queues.get_mut(queue_name) {
-            qs.stats.queued = qs.stats.queued.saturating_sub(1);
-            qs.stats.running += 1;
-        }
-
-        let context = JobContext {
-            id: job.id,
-            queue: job.queue.clone(),
-            payload: job.spec.payload.clone(),
-            attempt: job.attempts,
-            max_attempts: job.spec.max_attempts,
-            cancellation,
-        };
-
-        Some(LeasedJob { context, lease_id })
-    }
-
-    /// Dispatch work to parked workers if available.
-    fn try_dispatch_parked_workers(&mut self) {
+    async fn try_dispatch_parked_workers(&mut self) {
         if self.shutting_down {
             return;
         }
 
         while !self.parked_workers.is_empty() {
-            let Some(job) = self.try_lease_job() else {
+            let Some(job) = self.try_lease_job().await else {
                 break;
             };
             if let Some(worker) = self.parked_workers.pop_front()
@@ -549,7 +607,7 @@ impl Coordinator {
         }
     }
 
-    fn do_worker_outcome(&mut self, id: JobId, lease_id: LeaseId, outcome: WorkerOutcome) {
+    async fn do_worker_outcome(&mut self, id: JobId, lease_id: LeaseId, outcome: WorkerOutcome) {
         let Some(lease) = self.leases.get(&id) else {
             self.global_stats.stale_outcomes += 1;
             return;
@@ -572,60 +630,118 @@ impl Coordinator {
 
         match outcome {
             WorkerOutcome::Success => {
-                self.complete_job(id, &queue_name);
+                self.complete_job(id, lease_id, &queue_name).await;
             }
             WorkerOutcome::Fatal => {
-                self.dead_job(id, &queue_name);
+                self.dead_job(id, lease_id, &queue_name).await;
             }
             WorkerOutcome::Retryable | WorkerOutcome::Panic => {
                 if attempts >= max_attempts {
-                    self.dead_job(id, &queue_name);
+                    self.dead_job(id, lease_id, &queue_name).await;
                 } else {
-                    self.schedule_retry(id, &queue_name, attempts);
+                    self.schedule_retry(id, lease_id, &queue_name, attempts)
+                        .await;
                 }
             }
         }
     }
 
-    fn complete_job(&mut self, id: JobId, queue_name: &QueueName) {
-        if let Ok(_record) = self.store.transition(id, JobState::Completed) {
-            if let Some(qs) = self.queues.get_mut(queue_name.as_str()) {
-                qs.stats.running = qs.stats.running.saturating_sub(1);
-                qs.stats.completed += 1;
-            }
-            self.permits.remove(&id);
-            self.global_stats.completed += 1;
+    /// COMPLETION ordering: build record -> persist -> apply -> release capacity.
+    async fn complete_job(&mut self, id: JobId, lease_id: LeaseId, queue_name: &QueueName) {
+        let completed_at = UnixMillis::now();
+        let wal_record = WalRecord::JobCompleted {
+            id,
+            lease_id,
+            completed_at,
+        };
+
+        if let Err(e) = self.storage.persist(wal_record.clone()).await {
+            tracing_style_log("complete persist failed", &e);
+            return;
         }
+
+        if self.store.apply_record(&wal_record).is_err() {
+            return;
+        }
+
+        if let Some(qs) = self.queues.get_mut(queue_name.as_str()) {
+            qs.stats.running = qs.stats.running.saturating_sub(1);
+            qs.stats.completed += 1;
+        }
+        self.permits.remove(&id);
+        self.global_stats.completed += 1;
     }
 
-    fn dead_job(&mut self, id: JobId, queue_name: &QueueName) {
-        if let Ok(_record) = self.store.transition(id, JobState::Dead) {
-            if let Some(qs) = self.queues.get_mut(queue_name.as_str()) {
-                qs.stats.running = qs.stats.running.saturating_sub(1);
-                qs.stats.dead += 1;
-            }
-            self.permits.remove(&id);
-            self.global_stats.dead += 1;
+    /// DEAD ordering: build record -> persist -> apply -> release capacity.
+    async fn dead_job(&mut self, id: JobId, lease_id: LeaseId, queue_name: &QueueName) {
+        let dead_at = UnixMillis::now();
+        let wal_record = WalRecord::JobDead {
+            id,
+            lease_id,
+            dead_at,
+        };
+
+        if let Err(e) = self.storage.persist(wal_record.clone()).await {
+            tracing_style_log("dead persist failed", &e);
+            return;
         }
+
+        if self.store.apply_record(&wal_record).is_err() {
+            return;
+        }
+
+        if let Some(qs) = self.queues.get_mut(queue_name.as_str()) {
+            qs.stats.running = qs.stats.running.saturating_sub(1);
+            qs.stats.dead += 1;
+        }
+        self.permits.remove(&id);
+        self.global_stats.dead += 1;
     }
 
-    fn schedule_retry(&mut self, id: JobId, queue_name: &QueueName, attempt: u32) {
-        if let Ok(_record) = self.store.transition(id, JobState::RetryWaiting) {
-            if let Some(qs) = self.queues.get_mut(queue_name.as_str()) {
-                qs.stats.running = qs.stats.running.saturating_sub(1);
-                qs.stats.retrying += 1;
-            }
+    /// RETRY ordering: calculate delay -> build record -> persist -> apply -> set timer.
+    async fn schedule_retry(
+        &mut self,
+        id: JobId,
+        lease_id: LeaseId,
+        queue_name: &QueueName,
+        attempt: u32,
+    ) {
+        // Calculate delay and wall-clock available_at before persist.
+        let delay = self.config.retry.delay_with_rng(attempt, &mut self.rng);
+        let wall_clock_available_at =
+            UnixMillis::from_millis(UnixMillis::now().as_millis() + delay.as_millis() as i64);
 
-            let delay = self.config.retry.delay_with_rng(attempt, &mut self.rng);
-            let available_at = Instant::now() + delay;
+        let wal_record = WalRecord::JobRetryScheduled {
+            id,
+            lease_id,
+            attempt,
+            available_at: wall_clock_available_at,
+        };
 
-            self.retry_queue.push(RetryEntry {
-                available_at,
-                job_id: id,
-            });
-
-            self.global_stats.retried += 1;
+        if let Err(e) = self.storage.persist(wal_record.clone()).await {
+            tracing_style_log("retry persist failed", &e);
+            return;
         }
+
+        if self.store.apply_record(&wal_record).is_err() {
+            return;
+        }
+
+        if let Some(qs) = self.queues.get_mut(queue_name.as_str()) {
+            qs.stats.running = qs.stats.running.saturating_sub(1);
+            qs.stats.retrying += 1;
+        }
+
+        // Derive monotonic timer from persisted wall-clock time.
+        let available_at = Instant::now() + delay;
+
+        self.retry_queue.push(RetryEntry {
+            available_at,
+            wall_clock_available_at,
+            job_id: id,
+        });
+
+        self.global_stats.retried += 1;
     }
 
     fn process_due_retries(&mut self) {
@@ -649,7 +765,7 @@ impl Coordinator {
 
             let queue_name = job.queue.clone();
 
-            if let Ok(_record) = self.store.transition(job_id, JobState::Queued)
+            if self.store.transition_to_queued(job_id).is_ok()
                 && let Some(qs) = self.queues.get_mut(queue_name.as_str())
             {
                 qs.stats.retrying = qs.stats.retrying.saturating_sub(1);
@@ -659,17 +775,17 @@ impl Coordinator {
         }
     }
 
-    fn check_lease_timeouts(&mut self) {
+    async fn check_lease_timeouts(&mut self) {
         let now = Instant::now();
         let mut timed_out = Vec::new();
 
         for (&job_id, lease) in &self.leases {
             if lease.deadline <= now {
-                timed_out.push(job_id);
+                timed_out.push((job_id, lease.lease_id));
             }
         }
 
-        for job_id in timed_out {
+        for (job_id, lease_id) in timed_out {
             if let Some(lease) = self.leases.remove(&job_id) {
                 lease.cancellation.cancel();
 
@@ -682,11 +798,16 @@ impl Coordinator {
                 let max_attempts = job.spec.max_attempts;
 
                 if attempts >= max_attempts {
-                    self.dead_job(job_id, &queue_name);
+                    self.dead_job(job_id, lease_id, &queue_name).await;
                 } else {
-                    self.schedule_retry(job_id, &queue_name, attempts);
+                    self.schedule_retry(job_id, lease_id, &queue_name, attempts)
+                        .await;
                 }
             }
         }
     }
+}
+
+fn tracing_style_log(_msg: &str, _err: &impl std::fmt::Debug) {
+    // Placeholder for future tracing integration.
 }

@@ -6,6 +6,9 @@ license = "Apache-2.0"
 description = "A durable async job queue with bounded backpressure"
 
 [dependencies]
+crc32fast = "1"
+fs4 = "0.12"
+postcard = { version = "1", features = ["alloc"] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -14,4 +17,5 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time", "test-util"] }

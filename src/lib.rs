@@ -9,6 +9,7 @@ mod runtime;
 mod stats;
 mod store;
 mod types;
+pub mod wal;
 mod worker;
 
 pub use config::{Jitter, QueueConfig, RetryConfig, RuntimeConfig};
@@ -17,11 +18,13 @@ pub use handle::QueueHandle;
 pub use handler::{Handler, JobContext, JobError};
 pub use runtime::Runtime;
 pub use stats::{QueueStats, StatsSnapshot};
-pub use types::{JobId, JobRecord, JobSpec, JobState, LeaseId, QueueName};
+pub use store::StorageConfig;
+pub use types::{JobId, JobRecord, JobSpec, JobState, LeaseId, QueueName, UnixMillis};
 
 use coordinator::Coordinator;
 use std::collections::HashMap;
 use std::sync::Arc;
+use store::Storage;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +35,8 @@ use tokio_util::sync::CancellationToken;
 pub async fn start(config: RuntimeConfig) -> Result<QueueHandle> {
     config.validate()?;
 
+    let storage = Storage::open(&config.storage)?;
+
     let mut semaphores = HashMap::new();
     for qc in &config.queues {
         let sem = Arc::new(Semaphore::new(qc.capacity));
@@ -41,7 +46,7 @@ pub async fn start(config: RuntimeConfig) -> Result<QueueHandle> {
 
     let shutdown_token = CancellationToken::new();
     let (cmd_tx, cmd_rx) = mpsc::channel(config.channel_capacity);
-    let coordinator = Coordinator::new(config, cmd_rx, semaphores.clone(), shutdown_token);
+    let coordinator = Coordinator::new(config, storage, cmd_rx, semaphores.clone(), shutdown_token);
 
     tokio::spawn(coordinator.run());
 
