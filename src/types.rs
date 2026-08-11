@@ -1,0 +1,107 @@
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
+use uuid::Uuid;
+
+/// Unique identifier for a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct JobId(Uuid);
+
+impl JobId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for JobId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for JobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Name identifying a queue.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QueueName(String);
+
+impl QueueName {
+    pub fn new(name: impl Into<String>) -> Option<Self> {
+        let name = name.into();
+        if name.is_empty() {
+            None
+        } else {
+            Some(Self(name))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for QueueName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Current state of a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobState {
+    Queued,
+    Running,
+    RetryWaiting,
+    Completed,
+    Dead,
+    Cancelled,
+}
+
+impl JobState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Dead | Self::Cancelled)
+    }
+}
+
+/// Job specification provided at submission time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSpec {
+    pub payload: Vec<u8>,
+}
+
+impl JobSpec {
+    pub fn new(payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            payload: payload.into(),
+        }
+    }
+}
+
+/// Complete record of a job including immutable spec and mutable state.
+#[derive(Debug, Clone)]
+pub struct JobRecord {
+    pub id: JobId,
+    pub queue: QueueName,
+    pub spec: JobSpec,
+    pub state: JobState,
+    pub created_at: Instant,
+}
+
+impl JobRecord {
+    pub fn new(id: JobId, queue: QueueName, spec: JobSpec) -> Self {
+        Self {
+            id,
+            queue,
+            spec,
+            state: JobState::Queued,
+            created_at: Instant::now(),
+        }
+    }
+}
