@@ -23,6 +23,9 @@ pub enum Error {
         to: crate::types::JobState,
     },
 
+    #[error("stale lease: job {0} has moved to a newer lease")]
+    StaleLease(String),
+
     #[error("queue system is shutting down")]
     ShuttingDown,
 }

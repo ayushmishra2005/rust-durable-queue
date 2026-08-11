@@ -28,6 +28,20 @@ impl std::fmt::Display for JobId {
     }
 }
 
+/// Unique lease identity for fencing stale worker outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LeaseId(u64);
+
+impl LeaseId {
+    pub fn new(epoch: u64) -> Self {
+        Self(epoch)
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Name identifying a queue.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueueName(String);
@@ -74,13 +88,20 @@ impl JobState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
     pub payload: Vec<u8>,
+    pub max_attempts: u32,
 }
 
 impl JobSpec {
     pub fn new(payload: impl Into<Vec<u8>>) -> Self {
         Self {
             payload: payload.into(),
+            max_attempts: 3,
         }
+    }
+
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts;
+        self
     }
 }
 
@@ -91,6 +112,7 @@ pub struct JobRecord {
     pub queue: QueueName,
     pub spec: JobSpec,
     pub state: JobState,
+    pub attempts: u32,
     pub created_at: Instant,
 }
 
@@ -101,6 +123,7 @@ impl JobRecord {
             queue,
             spec,
             state: JobState::Queued,
+            attempts: 0,
             created_at: Instant::now(),
         }
     }

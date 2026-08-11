@@ -4,13 +4,32 @@ A single-process async job queue written in Rust. Currently under development.
 
 ## Current Features
 
-- Named queues with independent capacity
-- Bounded capacity with backpressure
-- Async submission (`submit`) with wait-for-capacity
-- Non-blocking submission (`try_submit`)
-- Job status lookup
-- Queued job cancellation
+- Bounded named queues with configurable capacity
+- Concurrent workers with configurable concurrency
+- Async handler API with job context
+- Leases with fencing for stale outcome rejection
+- Visibility timeout for hanging jobs
+- Retries with exponential backoff and jitter
+- Dead-letter state for exhausted retries and fatal failures
+- Cancellation of queued, waiting, and running jobs
+- Graceful shutdown with cooperative cancellation
 - Coordinator-owned mutable state (no shared locks)
+
+## Job Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Queued: submit
+    Queued --> Running: worker fetches
+    Running --> Completed: success
+    Running --> RetryWaiting: retryable failure
+    Running --> Dead: fatal / exhausted
+    RetryWaiting --> Queued: retry delay
+    RetryWaiting --> Dead: exhausted
+    Queued --> Cancelled: cancel
+    Running --> Cancelled: cancel
+    RetryWaiting --> Cancelled: cancel
+```
 
 ## Architecture
 
@@ -22,24 +41,61 @@ graph TD
     C --> S[Job Store]
     C --> Q[Queue State]
     C --> R[Ready Queue]
+    C --> L[Leases]
+    C --> RT[Retry Scheduler]
+    W1[Worker] -->|FetchWork| C
+    W2[Worker] -->|FetchWork| C
+    C -->|LeasedJob| W1
+    C -->|LeasedJob| W2
+    W1 -->|Outcome| C
+    W2 -->|Outcome| C
 ```
 
-The coordinator task exclusively owns mutable queue state. Producers communicate
-via a bounded mpsc channel. No locks are held across await points.
+The coordinator task exclusively owns mutable queue state. Workers request
+work via bounded channels and report outcomes back. No locks are held across
+await points.
 
-## Backpressure
+## Retries
 
-Two submission methods handle capacity differently:
+Jobs that fail with a retryable error are scheduled for retry:
 
-- `submit()` - waits asynchronously if the queue is full, proceeds when capacity
-  becomes available
-- `try_submit()` - returns immediately with `QueueFull` error if at capacity
+- Exponential backoff: base delay doubles each attempt
+- Maximum delay caps the backoff
+- Configurable jitter (None or Full)
+- `max_attempts` controls total allowed executions
+
+Example: `max_attempts = 3` allows attempts 1, 2, 3 then Dead.
+
+## Leases
+
+Each running job has a unique lease identity (monotonic epoch). When a worker
+reports an outcome, the coordinator validates the lease. Stale outcomes from
+old leases (e.g., after timeout/retry) are rejected.
+
+## Visibility Timeout
+
+If a running job exceeds its visibility timeout:
+
+1. The lease is invalidated
+2. The job is scheduled for retry (if attempts remain)
+3. Late results from the original worker are rejected as stale
+
+## Graceful Shutdown
+
+Calling `runtime.shutdown()`:
+
+1. Stops accepting new submissions
+2. Cancels all active leases
+3. Wakes blocked submitters with ShuttingDown error
+4. Workers exit their loops
+
+Cooperative: handlers should check `ctx.is_cancelled()` for timely exit.
 
 ## Development Status
 
-**Current step:** in-memory async queue core.
+**Current step:** in-memory async job runtime with workers, leases, and retries.
 
-Future work will add workers, retries, and durability (WAL-based persistence).
+Future work will add durability (WAL-based persistence).
 
 ## Build and Test
 

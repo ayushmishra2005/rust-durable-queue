@@ -24,6 +24,10 @@ impl MemoryStore {
         self.jobs.get(&id)
     }
 
+    pub fn get_mut(&mut self, id: JobId) -> Option<&mut JobRecord> {
+        self.jobs.get_mut(&id)
+    }
+
     pub fn transition(&mut self, id: JobId, to: JobState) -> Result<JobRecord> {
         let record = self
             .jobs
@@ -48,8 +52,10 @@ impl MemoryStore {
                 | (Running, Completed)
                 | (Running, RetryWaiting)
                 | (Running, Dead)
+                | (Running, Cancelled)
                 | (RetryWaiting, Queued)
                 | (RetryWaiting, Dead)
+                | (RetryWaiting, Cancelled)
         )
     }
 }
