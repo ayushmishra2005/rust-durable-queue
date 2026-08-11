@@ -12,7 +12,9 @@ A single-process async job queue written in Rust. Currently under development.
 - Retries with exponential backoff and jitter
 - Dead-letter state for exhausted retries and fatal failures
 - Cancellation of queued, waiting, and running jobs
-- Graceful shutdown with cooperative cancellation
+- Graceful shutdown with configurable timeout
+- Round-robin scheduling across named queues
+- Parked workers (no polling)
 - Coordinator-owned mutable state (no shared locks)
 
 ## Job Lifecycle
@@ -43,6 +45,7 @@ graph TD
     C --> R[Ready Queue]
     C --> L[Leases]
     C --> RT[Retry Scheduler]
+    C --> PW[Parked Workers]
     W1[Worker] -->|FetchWork| C
     W2[Worker] -->|FetchWork| C
     C -->|LeasedJob| W1
@@ -51,9 +54,9 @@ graph TD
     W2 -->|Outcome| C
 ```
 
-The coordinator task exclusively owns mutable queue state. Workers request
-work via bounded channels and report outcomes back. No locks are held across
-await points.
+The coordinator task exclusively owns mutable queue state. Workers are parked
+when idle (no polling) and woken immediately when work is available. Jobs are
+scheduled round-robin across named queues (FIFO within each queue).
 
 ## Retries
 
@@ -90,11 +93,16 @@ The coordinator wakes itself at the next deadline; no polling or external comman
 Calling `runtime.shutdown()`:
 
 1. Stops accepting new submissions
-2. Cancels all active leases
-3. Wakes blocked submitters with ShuttingDown error
-4. Workers exit their loops
+2. Closes semaphores (blocked submitters wake with ShuttingDown)
+3. Stops leasing new jobs
+4. Waits up to `shutdown_timeout` for running jobs to complete
+5. If all running jobs finish, shutdown completes early
+6. After timeout, remaining leases are cancelled
+7. Late outcomes from cancelled jobs are rejected as stale
 
-Cooperative: handlers should check `ctx.is_cancelled()` for timely exit.
+Cancellation is cooperative: handlers should check `ctx.is_cancelled()` for
+timely exit. Async tasks can be aborted, but external side effects may already
+have occurred.
 
 ## Development Status
 

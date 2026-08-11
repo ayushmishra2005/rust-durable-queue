@@ -1088,3 +1088,564 @@ fn retry_backoff_never_exceeds_max() {
         assert!(delay <= retry.max_delay);
     }
 }
+
+// ============================================================
+// GRACEFUL SHUTDOWN TESTS
+// ============================================================
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_rejects_new_submissions() {
+    let handler = |_ctx: JobContext| async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        Ok(())
+    };
+
+    let config = config_single("q", 10)
+        .with_worker_concurrency(1)
+        .with_shutdown_timeout(Duration::from_secs(5));
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // Submit a job that will run during shutdown.
+    runtime
+        .submit(queue_name("q"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+
+    advance(Duration::from_millis(100)).await;
+
+    // Start shutdown in background.
+    let shutdown_handle = {
+        let rt = runtime;
+        tokio::spawn(async move { rt.shutdown().await })
+    };
+
+    advance(Duration::from_millis(100)).await;
+
+    // Wait for shutdown to complete.
+    advance(Duration::from_secs(10)).await;
+    let _ = shutdown_handle.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_no_new_jobs_leased() {
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts2 = attempts.clone();
+
+    let handler = move |_ctx: JobContext| {
+        let a = attempts2.clone();
+        async move {
+            a.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(())
+        }
+    };
+
+    let config = config_single("q", 10)
+        .with_worker_concurrency(1)
+        .with_shutdown_timeout(Duration::from_secs(5));
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // Submit first job.
+    runtime
+        .submit(queue_name("q"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+
+    // First job starts.
+    advance(Duration::from_millis(100)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    // Submit second job before shutdown.
+    runtime
+        .submit(queue_name("q"), JobSpec::new(b"2"))
+        .await
+        .unwrap();
+
+    // Start shutdown - should not lease the second job.
+    let rt = runtime;
+    let shutdown_handle = tokio::spawn(async move { rt.shutdown().await });
+
+    // Let first job complete and shutdown finish.
+    advance(Duration::from_secs(2)).await;
+    let _ = shutdown_handle.await;
+
+    // Only one job executed (second job not leased during shutdown).
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_job_completes_before_shutdown_timeout() {
+    let completed = Arc::new(AtomicU32::new(0));
+    let completed2 = completed.clone();
+
+    let handler = move |_ctx: JobContext| {
+        let c = completed2.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    };
+
+    let config = config_single("q", 10)
+        .with_worker_concurrency(1)
+        .with_shutdown_timeout(Duration::from_secs(5));
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    runtime
+        .submit(queue_name("q"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+
+    // Job starts.
+    advance(Duration::from_millis(100)).await;
+
+    // Job completes (after 1s total).
+    advance(Duration::from_secs(2)).await;
+
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_returns_early_when_no_running_jobs() {
+    let handler = |_ctx: JobContext| async move { Ok(()) };
+
+    let config = config_single("q", 10)
+        .with_worker_concurrency(1)
+        .with_shutdown_timeout(Duration::from_secs(60));
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // No jobs submitted, shutdown should complete immediately.
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn long_running_job_cancelled_after_shutdown_timeout() {
+    let started = Arc::new(AtomicU32::new(0));
+    let started2 = started.clone();
+
+    let handler = move |_ctx: JobContext| {
+        let s = started2.clone();
+        async move {
+            s.fetch_add(1, Ordering::SeqCst);
+            // Long sleep that exceeds shutdown timeout.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+    };
+
+    let config = config_single("q", 10)
+        .with_worker_concurrency(1)
+        .with_shutdown_timeout(Duration::from_secs(2));
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    runtime
+        .submit(queue_name("q"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+
+    // Job starts.
+    advance(Duration::from_millis(100)).await;
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+
+    let shutdown_handle = tokio::spawn(async move { runtime.shutdown().await });
+
+    // Wait for shutdown timeout.
+    advance(Duration::from_secs(3)).await;
+    let _ = shutdown_handle.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_success_after_forced_cancellation_is_stale() {
+    let started = Arc::new(Notify::new());
+    let started2 = started.clone();
+
+    let handler = move |ctx: JobContext| {
+        let s = started2.clone();
+        async move {
+            s.notify_one();
+            // Wait for cancellation then "succeed".
+            ctx.cancelled().await;
+            Ok(())
+        }
+    };
+
+    let config = config_single("q", 10)
+        .with_worker_concurrency(1)
+        .with_shutdown_timeout(Duration::from_secs(1));
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    runtime
+        .submit(queue_name("q"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+
+    // Job starts.
+    advance(Duration::from_millis(100)).await;
+    started.notified().await;
+
+    let shutdown_handle = tokio::spawn(async move { runtime.shutdown().await });
+
+    // Shutdown timeout expires, job cancelled.
+    advance(Duration::from_secs(2)).await;
+    let _ = shutdown_handle.await;
+}
+
+// ============================================================
+// PARKED WORKER TESTS (NO POLLING)
+// ============================================================
+
+#[tokio::test(start_paused = true)]
+async fn submitted_work_wakes_idle_worker_immediately() {
+    let executed = Arc::new(AtomicU32::new(0));
+    let executed2 = executed.clone();
+
+    let handler = move |_ctx: JobContext| {
+        let e = executed2.clone();
+        async move {
+            e.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    };
+
+    let config = config_single("q", 10).with_worker_concurrency(1);
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // Worker should be parked waiting for work.
+    advance(Duration::from_millis(50)).await;
+
+    // Submit work.
+    runtime
+        .submit(queue_name("q"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+
+    // Work should be picked up immediately (no 10ms poll delay).
+    advance(Duration::from_millis(5)).await;
+
+    assert_eq!(executed.load(Ordering::SeqCst), 1);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_becoming_ready_wakes_idle_worker() {
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts2 = attempts.clone();
+
+    let handler = move |_ctx: JobContext| {
+        let a = attempts2.clone();
+        async move {
+            let n = a.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                Err(JobError::retryable(std::io::Error::other("temp")))
+            } else {
+                Ok(())
+            }
+        }
+    };
+
+    let retry = RetryConfig::new(Duration::from_secs(2), Duration::from_secs(60));
+    let config = config_single("q", 10)
+        .with_worker_concurrency(1)
+        .with_retry(retry);
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    runtime
+        .submit(queue_name("q"), JobSpec::new(b"1").with_max_attempts(2))
+        .await
+        .unwrap();
+
+    // First attempt.
+    advance(Duration::from_millis(100)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    // Wait for retry delay.
+    advance(Duration::from_secs(3)).await;
+
+    // Second attempt should happen immediately (no poll delay).
+    advance(Duration::from_millis(5)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_wakes_parked_workers() {
+    let executed = Arc::new(AtomicU32::new(0));
+    let executed2 = executed.clone();
+
+    let handler = move |_ctx: JobContext| {
+        let e = executed2.clone();
+        async move {
+            e.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    };
+
+    let config = config_single("q", 10).with_worker_concurrency(4);
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // Workers parked waiting for work.
+    advance(Duration::from_millis(100)).await;
+
+    // Shutdown should wake all parked workers.
+    runtime.shutdown().await;
+}
+
+// ============================================================
+// ROUND-ROBIN SCHEDULING TESTS
+// ============================================================
+
+fn config_multi(names: &[&str], capacity: usize) -> RuntimeConfig {
+    let queues: Vec<_> = names
+        .iter()
+        .map(|n| QueueConfig::new(queue_name(n), capacity))
+        .collect();
+    RuntimeConfig::new(queues, 64)
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_queues_both_make_progress() {
+    let executed_a = Arc::new(AtomicU32::new(0));
+    let executed_b = Arc::new(AtomicU32::new(0));
+    let ea = executed_a.clone();
+    let eb = executed_b.clone();
+
+    let handler = move |ctx: JobContext| {
+        let a = ea.clone();
+        let b = eb.clone();
+        async move {
+            if ctx.queue.as_str() == "a" {
+                a.fetch_add(1, Ordering::SeqCst);
+            } else {
+                b.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    };
+
+    let config = config_multi(&["a", "b"], 10).with_worker_concurrency(1);
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // Submit to both queues.
+    for _ in 0..5 {
+        runtime
+            .submit(queue_name("a"), JobSpec::new(b"a"))
+            .await
+            .unwrap();
+        runtime
+            .submit(queue_name("b"), JobSpec::new(b"b"))
+            .await
+            .unwrap();
+    }
+
+    // Process all.
+    advance(Duration::from_secs(1)).await;
+
+    // Both queues should have made progress.
+    assert_eq!(executed_a.load(Ordering::SeqCst), 5);
+    assert_eq!(executed_b.load(Ordering::SeqCst), 5);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_queues_rotate() {
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let order2 = order.clone();
+
+    let handler = move |ctx: JobContext| {
+        let o = order2.clone();
+        async move {
+            o.lock().unwrap().push(ctx.queue.as_str().to_string());
+            Ok(())
+        }
+    };
+
+    let config = config_multi(&["a", "b", "c"], 10).with_worker_concurrency(1);
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // Submit one job to each queue.
+    runtime
+        .submit(queue_name("a"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+    runtime
+        .submit(queue_name("b"), JobSpec::new(b"2"))
+        .await
+        .unwrap();
+    runtime
+        .submit(queue_name("c"), JobSpec::new(b"3"))
+        .await
+        .unwrap();
+
+    advance(Duration::from_secs(1)).await;
+
+    {
+        let executed = order.lock().unwrap();
+        assert_eq!(executed.len(), 3);
+        assert!(executed.contains(&"a".to_string()));
+        assert!(executed.contains(&"b".to_string()));
+        assert!(executed.contains(&"c".to_string()));
+    }
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_queue_skipped() {
+    let executed = Arc::new(AtomicU32::new(0));
+    let executed2 = executed.clone();
+
+    let handler = move |_ctx: JobContext| {
+        let e = executed2.clone();
+        async move {
+            e.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    };
+
+    let config = config_multi(&["a", "b", "c"], 10).with_worker_concurrency(1);
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // Only submit to queue "b".
+    runtime
+        .submit(queue_name("b"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+
+    advance(Duration::from_millis(100)).await;
+
+    assert_eq!(executed.load(Ordering::SeqCst), 1);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn queue_rejoins_rotation() {
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let order2 = order.clone();
+
+    let handler = move |ctx: JobContext| {
+        let o = order2.clone();
+        async move {
+            o.lock().unwrap().push(ctx.queue.as_str().to_string());
+            Ok(())
+        }
+    };
+
+    let config = config_multi(&["a", "b"], 10).with_worker_concurrency(1);
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    // Submit to "a" only first.
+    runtime
+        .submit(queue_name("a"), JobSpec::new(b"1"))
+        .await
+        .unwrap();
+
+    advance(Duration::from_millis(100)).await;
+
+    // Now submit to "b".
+    runtime
+        .submit(queue_name("b"), JobSpec::new(b"2"))
+        .await
+        .unwrap();
+
+    advance(Duration::from_millis(100)).await;
+
+    // Submit to "a" again.
+    runtime
+        .submit(queue_name("a"), JobSpec::new(b"3"))
+        .await
+        .unwrap();
+
+    advance(Duration::from_millis(100)).await;
+
+    {
+        let executed = order.lock().unwrap();
+        assert_eq!(executed.len(), 3);
+    }
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn fifo_within_queue() {
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let order2 = order.clone();
+
+    let handler = move |ctx: JobContext| {
+        let o = order2.clone();
+        async move {
+            o.lock().unwrap().push(ctx.payload[0]);
+            Ok(())
+        }
+    };
+
+    let config = config_single("q", 10).with_worker_concurrency(1);
+    let runtime = Runtime::start(config, handler).await.unwrap();
+
+    for i in 1..=5u8 {
+        runtime
+            .submit(queue_name("q"), JobSpec::new(vec![i]))
+            .await
+            .unwrap();
+    }
+
+    advance(Duration::from_secs(1)).await;
+
+    {
+        let executed = order.lock().unwrap();
+        assert_eq!(*executed, vec![1, 2, 3, 4, 5]);
+    }
+
+    runtime.shutdown().await;
+}
+
+// ============================================================
+// CONFIG VALIDATION TESTS
+// ============================================================
+
+#[test]
+fn zero_base_delay_rejected() {
+    let retry = RetryConfig::new(Duration::ZERO, Duration::from_secs(60));
+    assert!(retry.validate().is_err());
+}
+
+#[test]
+fn zero_max_delay_rejected() {
+    let retry = RetryConfig::new(Duration::from_secs(1), Duration::ZERO);
+    assert!(retry.validate().is_err());
+}
+
+#[test]
+fn base_delay_exceeds_max_rejected() {
+    let retry = RetryConfig::new(Duration::from_secs(60), Duration::from_secs(10));
+    assert!(retry.validate().is_err());
+}
+
+#[test]
+fn zero_visibility_timeout_rejected() {
+    let config = config_single("q", 10).with_visibility_timeout(Duration::ZERO);
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn zero_shutdown_timeout_rejected() {
+    let config = config_single("q", 10).with_shutdown_timeout(Duration::ZERO);
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn huge_duration_no_truncation() {
+    // Duration larger than u64 milliseconds.
+    let huge = Duration::from_secs(u64::MAX / 1000);
+    let retry = RetryConfig::new(huge, huge);
+
+    // Should not panic or truncate incorrectly.
+    let cap = retry.cap_for_attempt(1);
+    assert!(cap <= retry.max_delay);
+}

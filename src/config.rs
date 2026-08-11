@@ -57,14 +57,43 @@ impl RetryConfig {
         self
     }
 
+    /// Validate retry configuration.
+    pub fn validate(&self) -> Result<()> {
+        if self.base_delay.is_zero() {
+            return Err(Error::InvalidConfiguration(
+                "retry base_delay must be positive".into(),
+            ));
+        }
+        if self.max_delay.is_zero() {
+            return Err(Error::InvalidConfiguration(
+                "retry max_delay must be positive".into(),
+            ));
+        }
+        if self.base_delay > self.max_delay {
+            return Err(Error::InvalidConfiguration(
+                "retry base_delay must not exceed max_delay".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Calculate the capped backoff delay (before jitter) for a given attempt.
+    /// Uses saturating arithmetic to avoid overflow.
     pub fn cap_for_attempt(&self, attempt: u32) -> Duration {
-        let exp = attempt.saturating_sub(1).min(30);
-        let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
-        let delay_ms = self.base_delay.as_millis() as u64;
-        let backoff_ms = delay_ms.saturating_mul(multiplier);
-        let capped_ms = backoff_ms.min(self.max_delay.as_millis() as u64);
-        Duration::from_millis(capped_ms)
+        // Exponent is (attempt - 1) capped at 63 to avoid shift overflow.
+        let exp = attempt.saturating_sub(1).min(63);
+
+        // Use Duration's checked_mul to safely compute base_delay * 2^exp.
+        let mut backoff = self.base_delay;
+        for _ in 0..exp {
+            backoff = backoff.saturating_mul(2);
+            // Early exit if we've hit the cap.
+            if backoff >= self.max_delay {
+                return self.max_delay;
+            }
+        }
+
+        backoff.min(self.max_delay)
     }
 
     /// Calculate retry delay with jitter using provided RNG.
@@ -73,12 +102,21 @@ impl RetryConfig {
         match self.jitter {
             Jitter::None => cap,
             Jitter::Full => {
-                let cap_ms = cap.as_millis() as u64;
-                if cap_ms == 0 {
+                // Use nanos for precision, saturate on overflow.
+                let cap_nanos = cap.as_nanos();
+                if cap_nanos == 0 {
                     return Duration::ZERO;
                 }
-                let jittered_ms = rng.random_range(0..=cap_ms);
-                Duration::from_millis(jittered_ms)
+                // Safe: cap_nanos fits in u128, we sample in [0, cap_nanos].
+                let jittered_nanos = if cap_nanos <= u64::MAX as u128 {
+                    rng.random_range(0..=cap_nanos as u64) as u128
+                } else {
+                    // Very large durations: sample u64 and scale.
+                    let scale = cap_nanos / u64::MAX as u128;
+                    let base = rng.random_range(0..=u64::MAX) as u128;
+                    (base * scale).min(cap_nanos)
+                };
+                Duration::from_nanos(jittered_nanos.min(u64::MAX as u128) as u64)
             }
         }
     }
@@ -139,6 +177,20 @@ impl RuntimeConfig {
                 "worker concurrency must be positive".into(),
             ));
         }
+
+        if self.visibility_timeout.is_zero() {
+            return Err(Error::InvalidConfiguration(
+                "visibility_timeout must be positive".into(),
+            ));
+        }
+
+        if self.shutdown_timeout.is_zero() {
+            return Err(Error::InvalidConfiguration(
+                "shutdown_timeout must be positive".into(),
+            ));
+        }
+
+        self.retry.validate()?;
 
         let mut seen = HashSet::new();
         for queue in &self.queues {

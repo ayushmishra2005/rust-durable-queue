@@ -24,7 +24,6 @@ impl Runtime {
     pub async fn start<H: Handler>(config: RuntimeConfig, handler: H) -> Result<Self> {
         config.validate()?;
 
-        // Create semaphores for capacity control.
         let mut semaphores = HashMap::new();
         for qc in &config.queues {
             let sem = Arc::new(Semaphore::new(qc.capacity));
@@ -155,21 +154,18 @@ impl Runtime {
     }
 
     /// Initiates graceful shutdown.
+    /// Waits for running jobs to complete up to shutdown_timeout, then cancels remaining.
     pub async fn shutdown(mut self) {
-        // Signal shutdown.
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self
             .cmd_tx
             .send(Command::Shutdown { reply: reply_tx })
             .await;
+
+        // Wait for coordinator to signal shutdown complete.
         let _ = reply_rx.await;
 
-        // Close semaphores to wake blocked submitters.
-        for sem in self.semaphores.values() {
-            sem.close();
-        }
-
-        // Wait for workers.
+        // Wait for workers to exit.
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.await;
         }
