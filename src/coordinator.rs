@@ -4,6 +4,8 @@ use crate::handler::JobContext;
 use crate::stats::{QueueStats, StatsSnapshot};
 use crate::store::MemoryStore;
 use crate::types::{JobId, JobRecord, JobSpec, JobState, LeaseId, QueueName};
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -120,6 +122,7 @@ pub struct Coordinator {
     semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
     cmd_rx: mpsc::Receiver<Command>,
     config: RuntimeConfig,
+    rng: SmallRng,
     next_lease_epoch: u64,
     global_stats: GlobalStats,
     shutting_down: bool,
@@ -132,6 +135,23 @@ impl Coordinator {
         cmd_rx: mpsc::Receiver<Command>,
         semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
         shutdown_token: CancellationToken,
+    ) -> Self {
+        Self::with_rng(
+            config,
+            cmd_rx,
+            semaphores,
+            shutdown_token,
+            SmallRng::from_rng(&mut rand::rng()),
+        )
+    }
+
+    /// Create coordinator with explicit RNG for deterministic testing.
+    pub fn with_rng(
+        config: RuntimeConfig,
+        cmd_rx: mpsc::Receiver<Command>,
+        semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
+        shutdown_token: CancellationToken,
+        rng: SmallRng,
     ) -> Self {
         let mut queues = HashMap::new();
         for qc in &config.queues {
@@ -147,6 +167,7 @@ impl Coordinator {
             semaphores,
             cmd_rx,
             config,
+            rng,
             next_lease_epoch: 1,
             global_stats: GlobalStats::default(),
             shutting_down: false,
@@ -483,11 +504,8 @@ impl Coordinator {
                 qs.stats.retrying += 1;
             }
 
-            let delay = self.config.retry.delay_for_attempt(attempt);
-            // Apply jitter using a simple deterministic approach for now.
-            // In production with Jitter::Full, this would use rand.
-            let jittered = self.config.retry.apply_jitter(delay, 1.0);
-            let available_at = Instant::now() + jittered;
+            let delay = self.config.retry.delay_with_rng(attempt, &mut self.rng);
+            let available_at = Instant::now() + delay;
 
             self.retry_queue.push(RetryEntry {
                 available_at,

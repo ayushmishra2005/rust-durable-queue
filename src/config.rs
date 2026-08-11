@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::types::QueueName;
+use rand::Rng;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ impl QueueConfig {
 }
 
 /// Jitter mode for retry delays.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Jitter {
     #[default]
     None,
@@ -56,8 +57,8 @@ impl RetryConfig {
         self
     }
 
-    /// Calculate retry delay for given attempt using exponential backoff.
-    pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
+    /// Calculate the capped backoff delay (before jitter) for a given attempt.
+    pub fn cap_for_attempt(&self, attempt: u32) -> Duration {
         let exp = attempt.saturating_sub(1).min(30);
         let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
         let delay_ms = self.base_delay.as_millis() as u64;
@@ -66,13 +67,18 @@ impl RetryConfig {
         Duration::from_millis(capped_ms)
     }
 
-    /// Apply jitter to a delay.
-    pub fn apply_jitter(&self, delay: Duration, rand_factor: f64) -> Duration {
+    /// Calculate retry delay with jitter using provided RNG.
+    pub fn delay_with_rng(&self, attempt: u32, rng: &mut impl Rng) -> Duration {
+        let cap = self.cap_for_attempt(attempt);
         match self.jitter {
-            Jitter::None => delay,
+            Jitter::None => cap,
             Jitter::Full => {
-                let factor = rand_factor.clamp(0.0, 1.0);
-                Duration::from_secs_f64(delay.as_secs_f64() * factor)
+                let cap_ms = cap.as_millis() as u64;
+                if cap_ms == 0 {
+                    return Duration::ZERO;
+                }
+                let jittered_ms = rng.random_range(0..=cap_ms);
+                Duration::from_millis(jittered_ms)
             }
         }
     }

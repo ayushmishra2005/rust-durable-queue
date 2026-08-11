@@ -57,12 +57,15 @@ await points.
 
 ## Retries
 
-Jobs that fail with a retryable error are scheduled for retry:
+Jobs that fail with a retryable error are scheduled for retry automatically:
 
-- Exponential backoff: base delay doubles each attempt
-- Maximum delay caps the backoff
-- Configurable jitter (None or Full)
+- Exponential backoff: `cap = min(max_delay, base_delay * 2^(attempt-1))`
+- Jitter modes:
+  - `Jitter::None`: delay equals the cap
+  - `Jitter::Full`: delay sampled uniformly in `[0, cap]`
 - `max_attempts` controls total allowed executions
+
+Timers fire autonomously; no external activity is required.
 
 Example: `max_attempts = 3` allows attempts 1, 2, 3 then Dead.
 
@@ -76,9 +79,11 @@ old leases (e.g., after timeout/retry) are rejected.
 
 If a running job exceeds its visibility timeout:
 
-1. The lease is invalidated
+1. The lease is invalidated (timer fires autonomously)
 2. The job is scheduled for retry (if attempts remain)
 3. Late results from the original worker are rejected as stale
+
+The coordinator wakes itself at the next deadline; no polling or external commands required.
 
 ## Graceful Shutdown
 
