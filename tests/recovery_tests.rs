@@ -101,9 +101,6 @@ async fn queued_job_executes_after_restart() {
         rt.shutdown().await;
     }
 
-    // Give the lock file time to be released.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     // Restart - job should be recovered (was Running, now should complete).
     {
         let executed = Arc::new(AtomicU32::new(0));
@@ -171,9 +168,6 @@ async fn payload_preserved_after_restart() {
 
         rt.shutdown().await;
     }
-
-    // Give the lock file time to be released.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Restart and verify payload is preserved.
     {
@@ -244,9 +238,6 @@ async fn max_attempts_preserved_after_restart() {
 
         rt.shutdown().await;
     }
-
-    // Give the lock file time to be released.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Restart with retrying handler - job was Running with 1 attempt used,
     // so recovery should mark it Dead (attempts exhausted).
@@ -702,9 +693,6 @@ async fn crash_lost_running_with_attempts_remaining_is_retried() {
         // Graceful shutdown forces cancellation after timeout.
         rt.shutdown().await;
     }
-
-    // Give the lock file time to be released.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Restart - job should be rescheduled and eventually complete.
     {

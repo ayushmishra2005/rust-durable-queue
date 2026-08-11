@@ -3,9 +3,18 @@ name = "rust-durable-queue"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A durable async job queue with bounded backpressure"
+description = "A durable async job queue in Rust with bounded backpressure, retries, WAL recovery, and at-least-once execution"
+repository = "https://github.com/ayushmishra2005/rust-durable-queue"
+readme = "README.md"
+keywords = ["queue", "async", "durable", "wal", "job"]
+categories = ["asynchronous", "concurrency"]
+
+[[bin]]
+name = "rdq"
+path = "src/bin/rdq.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
 fs4 = "0.12"
 postcard = { version = "1", features = ["alloc"] }
@@ -14,8 +23,12 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"] }
 tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time", "test-util"] }

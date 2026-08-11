@@ -150,6 +150,8 @@ pub fn recover(path: &Path, config: &RuntimeConfig) -> WalResult<(RecoveredState
         wal_file.write_all(&header.encode())?;
         wal_file.sync_data()?;
 
+        tracing::info!("initialized new WAL");
+
         return Ok((
             RecoveredState {
                 store: MemoryStore::new(),
@@ -168,11 +170,17 @@ pub fn recover(path: &Path, config: &RuntimeConfig) -> WalResult<(RecoveredState
         ));
     }
 
+    tracing::info!("starting WAL recovery");
+
     // Scan WAL.
     let scan_result = scan_wal(&wal_path)?;
 
     // Repair truncated tail if needed.
     if scan_result.had_truncated_tail {
+        tracing::warn!(
+            last_valid_offset = scan_result.last_valid_offset,
+            "repairing truncated WAL tail"
+        );
         repair_truncated_tail(&wal_path, scan_result.last_valid_offset)?;
     }
 
@@ -275,6 +283,18 @@ pub fn recover(path: &Path, config: &RuntimeConfig) -> WalResult<(RecoveredState
 
     // Seek to end for appending.
     wal_file.seek(SeekFrom::End(0))?;
+
+    let queued_count: usize = queued_jobs.values().map(|v| v.len()).sum();
+    let retry_count = retry_jobs.len();
+
+    tracing::info!(
+        records = scan_result.records.len(),
+        last_sequence = scan_result.last_sequence,
+        queued = queued_count,
+        retrying = retry_count,
+        reconciled = reconciliation_records.len(),
+        "WAL recovery complete"
+    );
 
     Ok((
         RecoveredState {

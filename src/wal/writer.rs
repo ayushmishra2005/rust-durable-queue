@@ -22,8 +22,10 @@ struct WriteRequest {
 
 /// Handle for communicating with the WAL writer thread.
 pub struct WalWriter {
-    tx: mpsc::Sender<WriteRequest>,
-    _handle: JoinHandle<()>,
+    /// Sender for write requests. Must be dropped before joining handle.
+    tx: Option<mpsc::Sender<WriteRequest>>,
+    /// Writer thread handle. Joined on drop to ensure lock is released.
+    handle: Option<JoinHandle<()>>,
 }
 
 impl WalWriter {
@@ -54,8 +56,8 @@ impl WalWriter {
         });
 
         Ok(Self {
-            tx,
-            _handle: handle,
+            tx: Some(tx),
+            handle: Some(handle),
         })
     }
 
@@ -67,8 +69,8 @@ impl WalWriter {
         });
 
         Ok(Self {
-            tx,
-            _handle: handle,
+            tx: Some(tx),
+            handle: Some(handle),
         })
     }
 
@@ -144,10 +146,26 @@ impl WalWriter {
     pub async fn append(&self, record: WalRecord) -> WalResult<u64> {
         let (tx, rx) = oneshot::channel();
         self.tx
+            .as_ref()
+            .ok_or(WalError::WriterChannelClosed)?
             .send(WriteRequest { record, reply: tx })
             .await
             .map_err(|_| WalError::WriterChannelClosed)?;
         rx.await.map_err(|_| WalError::WriterChannelClosed)?
+    }
+}
+
+impl Drop for WalWriter {
+    fn drop(&mut self) {
+        // Drop sender first to signal thread to exit.
+        // This closes the channel, causing blocking_recv() to return None.
+        drop(self.tx.take());
+
+        // Now join the thread to ensure it has fully exited and released the lock.
+        if let Some(handle) = self.handle.take() {
+            // Ignore panic result - thread may have panicked but we still need to clean up.
+            let _ = handle.join();
+        }
     }
 }
 
@@ -245,8 +263,8 @@ impl TestableWalWriter {
 
         Ok(Self {
             inner: WalWriter {
-                tx,
-                _handle: handle,
+                tx: Some(tx),
+                handle: Some(handle),
             },
             fail_next_append,
             fail_next_sync,
@@ -265,6 +283,8 @@ impl TestableWalWriter {
         self.fail_next_sync.store(true, Ordering::SeqCst);
     }
 }
+
+// TestableWalWriter inherits Drop behavior from inner WalWriter.
 
 #[cfg(test)]
 mod tests {
@@ -380,5 +400,82 @@ mod tests {
             let seq = writer.append(record).await.unwrap();
             assert_eq!(seq, 4);
         }
+    }
+
+    #[test]
+    fn drop_releases_lock_immediately() {
+        let dir = TempDir::new().unwrap();
+
+        // Open and drop without appending.
+        {
+            let _writer = WalWriter::open(dir.path()).unwrap();
+        }
+
+        // Immediate reopen must succeed.
+        let _writer = WalWriter::open(dir.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_after_append_releases_lock_immediately() {
+        let dir = TempDir::new().unwrap();
+
+        {
+            let writer = WalWriter::open(dir.path()).unwrap();
+            let record = WalRecord::JobSubmitted {
+                id: JobId::new(),
+                queue: QueueName::new("test").unwrap(),
+                spec: JobSpec::new(b"data"),
+                created_at: UnixMillis::now(),
+            };
+            writer.append(record).await.unwrap();
+        }
+
+        // Immediate reopen must succeed.
+        let _writer = WalWriter::open(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn repeated_open_drop_cycle() {
+        let dir = TempDir::new().unwrap();
+
+        for _ in 0..10 {
+            let _writer = WalWriter::open(dir.path()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_open_append_drop_cycle() {
+        let dir = TempDir::new().unwrap();
+
+        for i in 0..5 {
+            let writer = WalWriter::open(dir.path()).unwrap();
+            let record = WalRecord::JobSubmitted {
+                id: JobId::new(),
+                queue: QueueName::new("test").unwrap(),
+                spec: JobSpec::new(b"data"),
+                created_at: UnixMillis::now(),
+            };
+            let seq = writer.append(record).await.unwrap();
+            assert_eq!(seq, i + 1);
+        }
+    }
+
+    #[test]
+    fn second_writer_fails_while_first_alive() {
+        let dir = TempDir::new().unwrap();
+        let _writer1 = WalWriter::open(dir.path()).unwrap();
+        let result = WalWriter::open(dir.path());
+        assert!(matches!(result, Err(WalError::StoreLocked)));
+    }
+
+    #[test]
+    fn second_writer_succeeds_after_first_dropped() {
+        let dir = TempDir::new().unwrap();
+
+        {
+            let _writer1 = WalWriter::open(dir.path()).unwrap();
+        }
+
+        let _writer2 = WalWriter::open(dir.path()).unwrap();
     }
 }

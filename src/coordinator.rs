@@ -653,7 +653,7 @@ impl Coordinator {
             // Persist.
             if let Err(e) = self.storage.persist(wal_record.clone()).await {
                 // Persist failed - job stays Queued, not exposed to worker.
-                tracing_style_log("lease persist failed", &e);
+                log_persist_error("lease", &e);
                 continue;
             }
 
@@ -767,7 +767,7 @@ impl Coordinator {
         };
 
         if let Err(e) = self.storage.persist(wal_record.clone()).await {
-            tracing_style_log("complete persist failed", &e);
+            log_persist_error("complete", &e);
             return;
         }
 
@@ -793,7 +793,7 @@ impl Coordinator {
         };
 
         if let Err(e) = self.storage.persist(wal_record.clone()).await {
-            tracing_style_log("dead persist failed", &e);
+            log_persist_error("dead", &e);
             return;
         }
 
@@ -830,7 +830,7 @@ impl Coordinator {
         };
 
         if let Err(e) = self.storage.persist(wal_record.clone()).await {
-            tracing_style_log("retry persist failed", &e);
+            log_persist_error("retry", &e);
             return;
         }
 
@@ -919,6 +919,6 @@ impl Coordinator {
     }
 }
 
-fn tracing_style_log(_msg: &str, _err: &impl std::fmt::Debug) {
-    // Placeholder for future tracing integration.
+fn log_persist_error(operation: &str, err: &impl std::fmt::Debug) {
+    tracing::error!(operation = operation, error = ?err, "WAL persist failed");
 }

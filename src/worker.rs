@@ -109,7 +109,7 @@ async fn execute_with_cancellation<H: Handler>(
                 }
                 Err(join_err) => {
                     if join_err.is_panic() {
-                        eprintln!("handler panicked for job {}", job_id);
+                        tracing::warn!(job_id = %job_id, "handler panicked");
                     }
                     WorkerOutcome::Panic
                 }
