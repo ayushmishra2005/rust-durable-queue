@@ -1,6 +1,7 @@
 use crate::config::RuntimeConfig;
 use crate::error::{Error, Result};
 use crate::handler::JobContext;
+use crate::recovery::RecoveredState;
 use crate::stats::{QueueStats, StatsSnapshot};
 use crate::store::{MemoryStore, Storage};
 use crate::types::{
@@ -11,6 +12,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -139,6 +141,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    #[allow(dead_code)] // Used in tests and start() without recovery.
     pub fn new(
         config: RuntimeConfig,
         storage: Storage,
@@ -146,16 +149,29 @@ impl Coordinator {
         semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
         shutdown_token: CancellationToken,
     ) -> Self {
-        Self::with_rng(
+        Self::new_with_recovery(config, storage, cmd_rx, semaphores, shutdown_token, None)
+    }
+
+    pub fn new_with_recovery(
+        config: RuntimeConfig,
+        storage: Storage,
+        cmd_rx: mpsc::Receiver<Command>,
+        semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
+        shutdown_token: CancellationToken,
+        recovered: Option<RecoveredState>,
+    ) -> Self {
+        Self::with_rng_and_recovery(
             config,
             storage,
             cmd_rx,
             semaphores,
             shutdown_token,
             SmallRng::from_rng(&mut rand::rng()),
+            recovered,
         )
     }
 
+    #[allow(dead_code)] // Used in tests.
     pub fn with_rng(
         config: RuntimeConfig,
         storage: Storage,
@@ -163,6 +179,26 @@ impl Coordinator {
         semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
         shutdown_token: CancellationToken,
         rng: SmallRng,
+    ) -> Self {
+        Self::with_rng_and_recovery(
+            config,
+            storage,
+            cmd_rx,
+            semaphores,
+            shutdown_token,
+            rng,
+            None,
+        )
+    }
+
+    pub fn with_rng_and_recovery(
+        config: RuntimeConfig,
+        storage: Storage,
+        cmd_rx: mpsc::Receiver<Command>,
+        semaphores: Arc<HashMap<String, Arc<Semaphore>>>,
+        shutdown_token: CancellationToken,
+        rng: SmallRng,
+        recovered: Option<RecoveredState>,
     ) -> Self {
         let mut queues = HashMap::new();
         let mut queue_order = Vec::with_capacity(config.queues.len());
@@ -172,22 +208,97 @@ impl Coordinator {
             queue_order.push(name);
         }
 
+        // Initialize from recovered state if present.
+        let (store, next_lease_epoch, global_stats, retry_queue) = if let Some(rec) = recovered {
+            let store = rec.store;
+            let next_lease_epoch = rec.next_lease_epoch;
+            let now = Instant::now();
+            let wall_now = UnixMillis::now();
+
+            // Rebuild ready queues from recovered queued jobs.
+            for (queue_name, job_ids) in &rec.queued_jobs {
+                if let Some(qs) = queues.get_mut(queue_name) {
+                    for &job_id in job_ids {
+                        if let Some(job) = store.get(job_id)
+                            && job.state == JobState::Queued
+                        {
+                            qs.ready.push_back(job_id);
+                            qs.stats.queued += 1;
+                        }
+                    }
+                }
+            }
+
+            // Build retry queue from recovered retry jobs.
+            let mut retry_queue = BinaryHeap::new();
+            for (job_id, available_at) in &rec.retry_jobs {
+                if let Some(job) = store.get(*job_id)
+                    && job.state == JobState::RetryWaiting
+                {
+                    // Calculate monotonic deadline from wall-clock delta.
+                    let remaining_ms = (available_at.as_millis() - wall_now.as_millis()).max(0);
+                    let delay = Duration::from_millis(remaining_ms as u64);
+                    let deadline = now + delay;
+
+                    retry_queue.push(RetryEntry {
+                        available_at: deadline,
+                        wall_clock_available_at: *available_at,
+                        job_id: *job_id,
+                    });
+
+                    if let Some(qs) = queues.get_mut(job.queue.as_str()) {
+                        qs.stats.retrying += 1;
+                    }
+                }
+            }
+
+            // Rebuild per-queue stats for terminal states.
+            for job in store.jobs() {
+                if let Some(qs) = queues.get_mut(job.queue.as_str()) {
+                    match job.state {
+                        JobState::Completed => qs.stats.completed += 1,
+                        JobState::Dead => qs.stats.dead += 1,
+                        JobState::Cancelled => qs.stats.cancelled += 1,
+                        _ => {}
+                    }
+                }
+            }
+
+            let global_stats = GlobalStats {
+                submitted: rec.submitted,
+                completed: rec.completed,
+                dead: rec.dead,
+                cancelled: rec.cancelled,
+                retried: rec.retried,
+                stale_outcomes: 0,
+            };
+
+            (store, next_lease_epoch, global_stats, retry_queue)
+        } else {
+            (
+                MemoryStore::new(),
+                1,
+                GlobalStats::default(),
+                BinaryHeap::new(),
+            )
+        };
+
         Self {
-            store: MemoryStore::new(),
+            store,
             storage,
             queues,
             queue_order,
             next_queue_idx: 0,
             permits: HashMap::new(),
             leases: HashMap::new(),
-            retry_queue: BinaryHeap::new(),
+            retry_queue,
             parked_workers: VecDeque::new(),
             semaphores,
             cmd_rx,
             config,
             rng,
-            next_lease_epoch: 1,
-            global_stats: GlobalStats::default(),
+            next_lease_epoch,
+            global_stats,
             shutting_down: false,
             shutdown_deadline: None,
             shutdown_reply: None,

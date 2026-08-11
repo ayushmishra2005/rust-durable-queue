@@ -19,9 +19,18 @@ impl MemoryStore {
         self.jobs.get(&id)
     }
 
-    #[allow(dead_code)] // For future replay.
     pub fn get_mut(&mut self, id: JobId) -> Option<&mut JobRecord> {
         self.jobs.get_mut(&id)
+    }
+
+    /// Insert a job directly (used during recovery).
+    pub fn insert_job(&mut self, job: JobRecord) {
+        self.jobs.insert(job.id, job);
+    }
+
+    /// Iterate over all jobs.
+    pub fn jobs(&self) -> impl Iterator<Item = &JobRecord> {
+        self.jobs.values()
     }
 
     /// Apply a WAL record to in-memory state.
@@ -175,6 +184,7 @@ pub enum Storage {
 }
 
 impl Storage {
+    #[allow(dead_code)] // Used in tests.
     pub fn open(config: &StorageConfig) -> crate::wal::WalResult<Self> {
         match config {
             StorageConfig::Memory => Ok(Self::Memory),
@@ -182,7 +192,22 @@ impl Storage {
         }
     }
 
-    #[allow(dead_code)] // For future use.
+    /// Open storage with recovery for WAL mode.
+    pub fn open_with_recovery(
+        config: &crate::config::RuntimeConfig,
+    ) -> crate::wal::WalResult<(Self, Option<crate::recovery::RecoveredState>)> {
+        match &config.storage {
+            StorageConfig::Memory => Ok((Self::Memory, None)),
+            StorageConfig::Wal { path } => {
+                let (recovered, wal_file, lock_file) = crate::recovery::recover(path, config)?;
+                let writer =
+                    WalWriter::from_recovered(wal_file, lock_file, recovered.next_sequence)?;
+                Ok((Self::Wal(writer), Some(recovered)))
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn is_durable(&self) -> bool {
         matches!(self, Self::Wal(_))
     }

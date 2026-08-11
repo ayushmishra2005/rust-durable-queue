@@ -2,9 +2,11 @@ use crate::config::RuntimeConfig;
 use crate::coordinator::{Command, Coordinator};
 use crate::error::{Error, Result};
 use crate::handler::Handler;
+use crate::recovery::RecoveredState;
 use crate::stats::StatsSnapshot;
 use crate::store::Storage;
-use crate::types::{JobId, JobRecord, JobSpec, QueueName};
+use crate::types::{JobId, JobRecord, JobSpec, JobState, QueueName};
+use crate::wal;
 use crate::worker::run_workers;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,8 +27,8 @@ impl Runtime {
     pub async fn start<H: Handler>(config: RuntimeConfig, handler: H) -> Result<Self> {
         config.validate()?;
 
-        // Open storage based on config.
-        let storage = Storage::open(&config.storage)?;
+        // Open storage with recovery.
+        let (storage, recovered_state) = Storage::open_with_recovery(&config)?;
 
         let mut semaphores = HashMap::new();
         for qc in &config.queues {
@@ -35,19 +37,27 @@ impl Runtime {
         }
         let semaphores = Arc::new(semaphores);
 
+        // Reserve permits for recovered jobs (before starting workers).
+        if let Some(ref recovered) = recovered_state {
+            Self::reserve_permits_for_recovered(&semaphores, recovered)?;
+        }
+
         let shutdown_token = CancellationToken::new();
         let (cmd_tx, cmd_rx) = mpsc::channel(config.channel_capacity);
 
-        let coordinator = Coordinator::new(
+        let coordinator = Coordinator::new_with_recovery(
             config.clone(),
             storage,
             cmd_rx,
             semaphores.clone(),
             shutdown_token.clone(),
+            recovered_state,
         );
 
+        // Start coordinator first (before workers).
         let coordinator_handle = tokio::spawn(coordinator.run());
 
+        // Now start workers - recovery is complete.
         let handler = Arc::new(handler);
         let worker_cmd_tx = cmd_tx.clone();
         let worker_shutdown = shutdown_token.clone();
@@ -64,6 +74,49 @@ impl Runtime {
             worker_handle: Some(worker_handle),
             coordinator_handle: Some(coordinator_handle),
         })
+    }
+
+    /// Reserve semaphore permits for recovered jobs.
+    fn reserve_permits_for_recovered(
+        semaphores: &HashMap<String, Arc<Semaphore>>,
+        recovered: &RecoveredState,
+    ) -> Result<()> {
+        // Count permits needed per queue.
+        let mut permits_needed: HashMap<String, usize> = HashMap::new();
+
+        // Queued jobs.
+        for (queue, jobs) in &recovered.queued_jobs {
+            *permits_needed.entry(queue.clone()).or_default() += jobs.len();
+        }
+
+        // Retry jobs.
+        for (job_id, _) in &recovered.retry_jobs {
+            if let Some(job) = recovered.store.get(*job_id)
+                && job.state == JobState::RetryWaiting
+            {
+                let queue = job.queue.as_str().to_string();
+                *permits_needed.entry(queue).or_default() += 1;
+            }
+        }
+
+        // Reserve permits.
+        for (queue, count) in permits_needed {
+            if let Some(sem) = semaphores.get(&queue) {
+                for _ in 0..count {
+                    let _permit = sem.clone().try_acquire_owned().map_err(|_| {
+                        Error::Storage(wal::WalError::RecoveryCapacityExceeded {
+                            queue: queue.clone(),
+                            recovered: count,
+                            capacity: sem.available_permits() + count,
+                        })
+                    })?;
+                    // Intentionally leak the permit - it will be managed by coordinator.
+                    std::mem::forget(_permit);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Submits a job, waiting for capacity if the queue is full.

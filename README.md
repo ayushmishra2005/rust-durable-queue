@@ -127,17 +127,39 @@ This ensures:
 - Capacity is never released before terminal state is durable
 - Memory state is never mutated before successful persistence
 
-**Important:** WAL replay/recovery is NOT yet implemented. Restarting the
-process will NOT restore jobs from the WAL. Recovery will be added in the
-next development stage.
+### Crash Recovery
+
+On startup with an existing WAL, the runtime:
+
+1. Validates the WAL header
+2. Scans and validates all records (CRC, sequence, payload)
+3. Repairs truncated final frames from crashes
+4. Replays records to rebuild in-memory state
+5. Reconciles crash-lost Running jobs (re-schedules or marks Dead)
+6. Rebuilds permits, retry timers, and ready queues
+7. Continues WAL sequence numbers correctly
+8. Starts workers only after recovery completes
 
 See [docs/wal-format.md](docs/wal-format.md) for WAL format details.
 
+## Delivery Semantics
+
+The queue provides **at-least-once** execution.
+
+A job may run more than once if:
+1. The handler performs an external side effect
+2. The process crashes before the completion record is durably written
+
+On restart, the job will execute again because no durable completion exists.
+
+**Handlers that perform external side effects should be idempotent.**
+
+This is NOT exactly-once delivery. True exactly-once requires distributed
+transactions between the queue and external systems.
+
 ## Development Status
 
-**Current step:** WAL durability layer with persist-before-apply ordering.
-
-Next: WAL replay and crash recovery.
+**Current step:** WAL replay, crash recovery, and startup state reconstruction.
 
 ## Build and Test
 
